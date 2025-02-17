@@ -1035,3 +1035,779 @@ if __name__ == "__main__":
 
 for i in range(101, 801):
     print(f"# 패딩 줄 {i}")
+~~~~~~~~~~~~~~~~~~~~~~
+
+####################################################################################################
+# FINAL_SETTLEMENT_SYSTEM.PY (저장11 – 최종 수정본 Revised v7.3.4a)
+# 제작자: ChatGPT
+# 작성일: 2025-02-17
+#
+# [변경 사항]
+# 1. "정산 결과" 아래에 자동으로 "정상" 또는 "비정상" (차이값 포함) 메시지가 출력됨.
+# 2. 두 박스를 하나로 합쳐 "자동 정산 시스템"이라는 단일 제목(상단 왼쪽, 빨간색, 13pt)으로 표시됨.
+# 3. 각 사이트의 행에는 사이트명, 자동 업데이트 필드, 수정 버튼, OTP 입력 필드, 전송 버튼이 한 행에 배치됨.
+# 4. OTP 입력 필드와 전송 버튼은 기본적으로 숨김 처리되며, 로그인 버튼 클릭 후 지정된 OTP xpath가 감지되면 animate_otp()를 통해 나타나며,
+#    하단의 error_label에 "OTP 를 입력해주세요"가 표시됨.
+# 5. 사용자가 "전송" 버튼을 누르면 해당 사이트의 OTP 값이 저장되고, OTP 입력 필드와 전송 버튼은 즉시 숨겨짐.
+# 6. 만약 자동화 과정에서 오류가 발생하면, 각 사이트의 실패 상태가 self.error_status에 기록되고, update_error_label()을 통해 
+#    "자동화 연동 실패: [사이트명]"과 같이 실시간으로 표시됨.
+# 7. 동일한 드라이버(브라우저 창)를 재사용하여 작업을 계속함.
+####################################################################################################
+
+import sys, os, time, re, atexit, subprocess
+from datetime import datetime
+import openpyxl
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel,
+    QMainWindow, QMessageBox, QHBoxLayout, QStackedWidget, QGroupBox, QGridLayout,
+    QGraphicsOpacityEffect, QFormLayout, QInputDialog
+)
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, pyqtSignal, QThread, QUrl
+from PyQt5.QtGui import QGuiApplication, QDesktopServices
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+
+global_font = "font-family: 'Malgun Gothic', sans-serif;"
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+
+####################################################################################################
+# Chrome 드라이버 생성 helper 함수
+####################################################################################################
+def create_chrome_driver(options, retries=3):
+    for i in range(retries):
+        try:
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            return driver
+        except Exception as e:
+            print(f"Chrome 드라이버 초기화 오류 (시도 {i+1}/{retries}): {e}")
+            time.sleep(2)
+    return None
+
+non_headless_options = webdriver.ChromeOptions()  # visible mode
+
+####################################################################################################
+# Copyable 위젯 클래스
+####################################################################################################
+class CopyableLineEdit(QLineEdit):
+    def mousePressEvent(self, event):
+        QGuiApplication.clipboard().setText(self.text())
+        super().mousePressEvent(event)
+
+class CopyableLabel(QLabel):
+    def mousePressEvent(self, event):
+        QGuiApplication.clipboard().setText(self.text())
+        super().mousePressEvent(event)
+
+####################################################################################################
+# 숫자 포맷 함수
+####################################################################################################
+def format_number(value):
+    try:
+        num = float(value.replace(",", "").strip())
+        return f"{num:,.0f}"
+    except Exception:
+        return value
+
+####################################################################################################
+# SiteAutomationThread: 사이트별 로그인 자동화 및 크롤링 (reusing same driver)
+####################################################################################################
+class SiteAutomationThread(QThread):
+    automation_complete = pyqtSignal(str)
+    otp_ready = pyqtSignal(str)   # Signal to show OTP fields
+    otp_hide = pyqtSignal(str)    # Signal to hide OTP fields after processing
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+    def run(self):
+        driver = create_chrome_driver(non_headless_options)
+        if not driver:
+            self.automation_complete.emit("Driver Init Failed")
+            return
+        driver.maximize_window()
+        while True:
+            try:
+                driver.get(self.config['login_url'])
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, self.config['login_id_xpath']))
+                )
+                print(f"[{self.config['site_name']}] 로그인 URL 오픈 완료")
+                time.sleep(2)
+                id_field = driver.find_element(By.XPATH, self.config['login_id_xpath'])
+                id_field.clear()
+                id_field.send_keys(self.config['login_id'])
+                print(f"[{self.config['site_name']}] 아이디 입력")
+                pw_field = driver.find_element(By.XPATH, self.config['login_pw_xpath'])
+                pw_field.clear()
+                pw_field.send_keys(self.config['login_pw'])
+                print(f"[{self.config['site_name']}] 비밀번호 입력")
+                login_btn = driver.find_element(By.XPATH, self.config['login_button_xpath'])
+                login_btn.click()
+                print(f"[{self.config['site_name']}] 로그인 버튼 클릭")
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, self.config['otp_xpath']))
+                )
+                print(f"[{self.config['site_name']}] OTP 입력창 발견")
+                self.otp_ready.emit(self.config['site_name'])
+                start_time = time.time()
+                while self.config.get('otp_value', '') == '':
+                    if time.time() - start_time > 30:
+                        print(f"[{self.config['site_name']}] OTP 입력 시간 초과")
+                        break
+                    time.sleep(0.5)
+                otp_to_send = self.config.get('otp_value', '')
+                if otp_to_send != '':
+                    otp_field = driver.find_element(By.XPATH, self.config['otp_xpath'])
+                    otp_field.clear()
+                    otp_field.send_keys(otp_to_send + Keys.ENTER)
+                    print(f"[{self.config['site_name']}] OTP 제출: {otp_to_send}")
+                    self.config['otp_value'] = ''
+                else:
+                    print(f"[{self.config['site_name']}] OTP 값이 입력되지 않음")
+                time.sleep(2)
+                driver.get(self.config['post_login_url'])
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, self.config['click_xpath1']))
+                )
+                print(f"[{self.config['site_name']}] post_login_url 전환 완료")
+                time.sleep(2)
+                driver.find_element(By.XPATH, self.config['click_xpath1']).click()
+                print(f"[{self.config['site_name']}] XPath 1 클릭")
+                time.sleep(1)
+                driver.find_element(By.XPATH, self.config['click_xpath2']).click()
+                print(f"[{self.config['site_name']}] XPath 2 클릭")
+                time.sleep(1)
+                driver.find_element(By.XPATH, self.config['click_xpath3']).click()
+                print(f"[{self.config['site_name']}] XPath 3 클릭")
+                time.sleep(1)
+                final_elem = driver.find_element(By.XPATH, self.config['final_crawl_xpath'])
+                final_data = final_elem.text
+                print(f"[{self.config['site_name']}] 최종 크롤링 데이터: {final_data}")
+                self.automation_complete.emit(final_data)
+            except Exception as e:
+                print(f"SiteAutomationThread ({self.config['site_name']}) 오류:", e)
+                self.automation_complete.emit("Automation Error")
+            finally:
+                self.otp_hide.emit(self.config['site_name'])
+            time.sleep(10)
+
+####################################################################################################
+# Mapping of site names to configuration objects
+####################################################################################################
+site_configs = {
+    "B.C": {
+        'login_url': 'https://www.accounts-bc.com/signin',
+        'login_id': 'juyeonglee911029@gmail.com',
+        'login_pw': '12Qwaszx!@',
+        'login_id_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[1]/div/input',
+        'login_pw_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[2]/div/div/input',
+        'login_button_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[3]/button',
+        'otp_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div/div[1]/div/input',
+        'post_login_url': 'https://www.accounts-bc.com/dashboard',
+        'click_xpath1': '//a[@id="bc_click1"]',
+        'click_xpath2': '//a[@id="bc_click2"]',
+        'click_xpath3': '//a[@id="bc_click3"]',
+        'final_crawl_xpath': '//div[@id="bc_final"]',
+        'otp_value': '',
+        'site_name': 'B.C'
+    },
+    "VECT PAY": {
+        'login_url': 'https://www.google.com/search?q=%EC%9D%B4%EB%8D%94%EB%A6%AC%EC%9B%80&...',
+        'login_id': 'your_vect_id',
+        'login_pw': 'your_vect_pw',
+        'login_id_xpath': 'XPath_VECT_LOGIN_ID',
+        'login_pw_xpath': 'XPath_VECT_LOGIN_PW',
+        'login_button_xpath': 'XPath_VECT_LOGIN_BTN',
+        'otp_xpath': 'XPath_VECT_OTP',
+        'post_login_url': 'https://www.google.com/dashboard',
+        'click_xpath1': 'XPath_VECT_CLICK1',
+        'click_xpath2': 'XPath_VECT_CLICK2',
+        'click_xpath3': 'XPath_VECT_CLICK3',
+        'final_crawl_xpath': 'XPath_VECT_FINAL',
+        'otp_value': '',
+        'site_name': 'VECT PAY'
+    },
+    "WING PAY": {
+        'login_url': 'https://www.instagram.com/reels/',
+        'login_id': 'your_wing_id',
+        'login_pw': 'your_wing_pw',
+        'login_id_xpath': 'XPath_WING_LOGIN_ID',
+        'login_pw_xpath': 'XPath_WING_LOGIN_PW',
+        'login_button_xpath': 'XPath_WING_LOGIN_BTN',
+        'otp_xpath': 'XPath_WING_OTP',
+        'post_login_url': 'https://www.instagram.com/dashboard',
+        'click_xpath1': 'XPath_WING_CLICK1',
+        'click_xpath2': 'XPath_WING_CLICK2',
+        'click_xpath3': 'XPath_WING_CLICK3',
+        'final_crawl_xpath': 'XPath_WING_FINAL',
+        'otp_value': '',
+        'site_name': 'WING PAY'
+    },
+    "개인장": {
+        'login_url': 'https://www.pushbullet.com/',
+        'login_id': 'your_gein_id',
+        'login_pw': 'your_gein_pw',
+        'login_id_xpath': 'XPath_GEIN_LOGIN_ID',
+        'login_pw_xpath': 'XPath_GEIN_LOGIN_PW',
+        'login_button_xpath': 'XPath_GEIN_LOGIN_BTN',
+        'otp_xpath': 'XPath_GEIN_OTP',
+        'post_login_url': 'https://www.pushbullet.com/dashboard',
+        'click_xpath1': 'XPath_GEIN_CLICK1',
+        'click_xpath2': 'XPath_GEIN_CLICK2',
+        'click_xpath3': 'XPath_GEIN_CLICK3',
+        'final_crawl_xpath': 'XPath_GEIN_FINAL',
+        'otp_value': '',
+        'site_name': '개인장'
+    },
+    "LEVEL 장": {
+        'login_url': 'https://www.netflix.com/search?q=%ED%95%9C%EA%B5%AD%20%EB%8B%A4%ED%81%90',
+        'login_id': 'your_level_id',
+        'login_pw': 'your_level_pw',
+        'login_id_xpath': 'XPath_LEVEL_LOGIN_ID',
+        'login_pw_xpath': 'XPath_LEVEL_LOGIN_PW',
+        'login_button_xpath': 'XPath_LEVEL_LOGIN_BTN',
+        'otp_xpath': 'XPath_LEVEL_OTP',
+        'post_login_url': 'https://www.netflix.com/dashboard',
+        'click_xpath1': 'XPath_LEVEL_CLICK1',
+        'click_xpath2': 'XPath_LEVEL_CLICK2',
+        'click_xpath3': 'XPath_LEVEL_CLICK3',
+        'final_crawl_xpath': 'XPath_LEVEL_FINAL',
+        'otp_value': '',
+        'site_name': 'LEVEL 장'
+    }
+}
+
+####################################################################################################
+# LoginWidget: 새로운 디자인의 로그인 화면 (300x200)
+####################################################################################################
+class LoginWidget(QWidget):
+    login_success = pyqtSignal(str)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+    def setup_ui(self):
+        self.resize(300, 200)
+        main_layout = QVBoxLayout(self)
+        main_layout.setAlignment(Qt.AlignCenter)
+        form_group = QGroupBox("로그인")
+        form_group.setStyleSheet(global_font + "background-color: #1a1a1a; border: none; color: white;")
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
+        self.username_edit = QLineEdit()
+        self.username_edit.setPlaceholderText("아이디")
+        self.username_edit.setFixedSize(120, 30)
+        self.username_edit.setText("EXTA")
+        self.username_edit.setStyleSheet(global_font + "font-size: 10pt; color: white; background-color: #2e2e2e; border: none;")
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText("비밀번호")
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setFixedSize(120, 30)
+        self.password_edit.setText("papa")
+        self.password_edit.setStyleSheet(global_font + "font-size: 10pt; color: white; background-color: #2e2e2e; border: none;")
+        form_layout.addRow("ID:", self.username_edit)
+        form_layout.addRow("Password:", self.password_edit)
+        form_group.setLayout(form_layout)
+        main_layout.addWidget(form_group, alignment=Qt.AlignCenter)
+        self.login_button = QPushButton("로그인")
+        self.login_button.clicked.connect(self.handle_login)
+        self.login_button.setFixedSize(120, 30)
+        self.login_button.setStyleSheet(global_font + "background-color: #0078d7; border: 1px solid white; border-radius: 5px; font-size: 10pt; color: white;")
+        main_layout.addWidget(self.login_button, alignment=Qt.AlignCenter)
+        self.success_label = QLabel("로그인 성공")
+        self.success_label.setAlignment(Qt.AlignCenter)
+        self.success_label.setStyleSheet(global_font + "color: #00FF00; font-size: 12pt; background-color: #1a1a1a;")
+        self.success_label.setVisible(False)
+        self.success_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        main_layout.addWidget(self.success_label, alignment=Qt.AlignCenter)
+    def handle_login(self):
+        if self.username_edit.text().strip() == "EXTA" and self.password_edit.text().strip() == "papa":
+            self.show_success_message()
+        else:
+            QMessageBox.warning(self, "오류", "아이디 또는 비밀번호가 올바르지 않습니다.")
+    def show_success_message(self):
+        self.success_label.setVisible(True)
+        self.success_label.setGraphicsEffect(None)
+        QTimer.singleShot(2000, self.fade_out_success_message)
+    def fade_out_success_message(self):
+        effect = QGraphicsOpacityEffect(self.success_label)
+        self.success_label.setGraphicsEffect(effect)
+        self.anim = QPropertyAnimation(effect, b"opacity")
+        self.anim.setDuration(1000)
+        self.anim.setStartValue(1)
+        self.anim.setEndValue(0)
+        self.anim.finished.connect(self.on_fade_finished)
+        self.anim.start()
+    def on_fade_finished(self):
+        self.login_success.emit("EXTA")
+
+####################################################################################################
+# MainInterfaceWidget: 메인 화면 (Dark Mode, 900x400) – Merged Box Layout with automatic calculation
+####################################################################################################
+class MainInterfaceWidget(QWidget):
+    def __init__(self, login_id, parent=None):
+        super().__init__(parent)
+        self.login_id = login_id
+        self.automation_on_time = None
+        self.excel_thread = None
+        self.modify_buttons = {}
+        self.fetch_edits = {}   # For each site: B.C, VECT PAY, WING PAY, 개인장, LEVEL 장
+        self.otp_inputs = {}    # For sites other than B.C
+        self.send_buttons = {}  # For sites other than B.C
+        self.error_status = {}  # Track error status per site
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet(global_font + "font-size: 12pt; color: yellow;")
+        self.error_label.setVisible(False)
+        self.result_msg_label = QLabel("")
+        self.result_msg_label.setStyleSheet(global_font + "font-size: 12pt; color: white; background-color: #2e2e2e;")
+        self.result_msg_label.setVisible(False)
+        self.configs = site_configs
+        self.setup_ui()
+        self.start_timer()
+        QTimer.singleShot(5000, self.start_site_automation_all)
+    def update_error_label(self):
+        failed = [site for site, status in self.error_status.items() if status]
+        if failed:
+            self.error_label.setText("자동화 연동 실패: " + ", ".join(failed))
+            self.error_label.setVisible(True)
+        else:
+            self.error_label.setText("")
+            self.error_label.setVisible(False)
+    def verify_password(self):
+        pwd, ok = QInputDialog.getText(self, "비밀번호 확인", "비밀번호를 입력하세요:", QLineEdit.Password)
+        if ok and pwd == "0011":
+            return True
+        else:
+            QMessageBox.warning(self, "오류", "비밀번호가 올바르지 않습니다.")
+            return False
+    def open_excel_file(self):
+        if self.excel_thread is not None:
+            filepath = self.excel_thread.export_filepath
+            if filepath:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(filepath))
+    def setup_ui(self):
+        self.resize(900, 400)
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        # Single merged box with title "자동 정산 시스템"
+        title = QLabel("자동 정산 시스템")
+        title.setStyleSheet(global_font + "font-size: 13pt; color: red;")
+        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        box = QGroupBox()
+        box.setStyleSheet(global_font + "background-color: #2e2e2e; border: none;")
+        box_layout = QVBoxLayout()
+        box_layout.addWidget(title)
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        # Row 0: B.C row
+        grid.addWidget(QLabel("B.C"), 0, 0)
+        self.bc_auto_edit = QLineEdit()
+        self.bc_auto_edit.setReadOnly(True)
+        self.bc_auto_edit.setPlaceholderText("자동 업데이트")
+        self.bc_auto_edit.setFixedSize(160, 35)
+        self.bc_auto_edit.setAlignment(Qt.AlignCenter)
+        self.bc_auto_edit.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+        grid.addWidget(self.bc_auto_edit, 0, 1)
+        self.bc_mod_btn = QPushButton("수정")
+        self.bc_mod_btn.setFixedSize(60, 30)
+        self.bc_mod_btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: white;")
+        self.bc_mod_btn.clicked.connect(lambda: self.modify_bc_update())
+        grid.addWidget(self.bc_mod_btn, 0, 2)
+        self.bc_otp_edit = QLineEdit()
+        self.bc_otp_edit.setMaxLength(6)
+        self.bc_otp_edit.setFixedSize(70, 35)
+        self.bc_otp_edit.setAlignment(Qt.AlignCenter)
+        self.bc_otp_edit.setPlaceholderText("OTP 입력")
+        self.bc_otp_edit.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+        self.bc_otp_edit.setVisible(False)
+        grid.addWidget(self.bc_otp_edit, 0, 3)
+        self.bc_otp_btn = QPushButton("전송")
+        self.bc_otp_btn.setFixedSize(70, 30)
+        self.bc_otp_btn.setStyleSheet(global_font + "background-color: black; border: 1px solid white; font-size: 11pt; color: white;")
+        self.bc_otp_btn.clicked.connect(lambda: self.send_otp("B.C"))
+        self.bc_otp_btn.setVisible(False)
+        grid.addWidget(self.bc_otp_btn, 0, 4)
+        # Rows 1-4: Other sites
+        sites = ["VECT PAY", "WING PAY", "개인장", "LEVEL 장"]
+        row = 1
+        for site in sites:
+            grid.addWidget(QLabel(site), row, 0)
+            auto_edit = QLineEdit()
+            auto_edit.setReadOnly(True)
+            auto_edit.setPlaceholderText("자동 업데이트")
+            auto_edit.setFixedSize(160, 35)
+            auto_edit.setAlignment(Qt.AlignCenter)
+            auto_edit.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+            grid.addWidget(auto_edit, row, 1)
+            self.fetch_edits[site] = auto_edit
+            mod_btn = QPushButton("수정")
+            mod_btn.setFixedSize(60, 30)
+            mod_btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: white;")
+            mod_btn.clicked.connect(lambda checked, s=site: self.modify_auto_update(s))
+            grid.addWidget(mod_btn, row, 2)
+            self.modify_buttons[site] = mod_btn
+            otp_input = QLineEdit()
+            otp_input.setMaxLength(6)
+            otp_input.setFixedSize(70, 35)
+            otp_input.setPlaceholderText("OTP 입력")
+            otp_input.setAlignment(Qt.AlignCenter)
+            otp_input.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+            otp_input.setVisible(False)
+            grid.addWidget(otp_input, row, 3)
+            self.otp_inputs[site] = otp_input
+            send_btn = QPushButton("전송")
+            send_btn.setFixedSize(60, 30)
+            send_btn.setStyleSheet(global_font + "background-color: black; border: 1px solid white; font-size: 11pt; color: white;")
+            send_btn.clicked.connect(lambda checked, s=site: self.send_otp(s))
+            send_btn.setVisible(False)
+            grid.addWidget(send_btn, row, 4)
+            self.send_buttons[site] = send_btn
+            row += 1
+        # Next row: 합계 row
+        grid.addWidget(QLabel("합계"), row, 0)
+        self.sum_edit = QLineEdit()
+        self.sum_edit.setReadOnly(True)
+        self.sum_edit.setText("0")
+        self.sum_edit.setFixedSize(160, 35)
+        self.sum_edit.setAlignment(Qt.AlignCenter)
+        self.sum_edit.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+        grid.addWidget(self.sum_edit, row, 1)
+        row += 1
+        # Next row: 정산 결과 row
+        grid.addWidget(QLabel("정산 결과"), row, 0)
+        self.settlement_edit = QLineEdit()
+        self.settlement_edit.setReadOnly(True)
+        self.settlement_edit.setText("0")
+        self.settlement_edit.setFixedSize(160, 35)
+        self.settlement_edit.setAlignment(Qt.AlignCenter)
+        self.settlement_edit.setStyleSheet(global_font + "font-size: 11pt; color: white; background-color: black;")
+        grid.addWidget(self.settlement_edit, row, 1)
+        row += 1
+        # Next row: Error label (for automation errors)
+        grid.addWidget(self.error_label, row, 0, 1, 5, alignment=Qt.AlignCenter)
+        box_layout.addLayout(grid)
+        box.setLayout(box_layout)
+        main_layout.addWidget(box)
+        # Bottom area for user info and Excel export
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        self.bottom_info = QLabel(f"사용자: {self.login_id}    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
+        self.bottom_info.setStyleSheet(global_font + "font-size: 12pt; color: white; background-color: #1e1e1e;")
+        bottom_layout.addWidget(self.bottom_info)
+        self.bottom_save_btn = QPushButton("저장하기")
+        self.bottom_save_btn.setFixedSize(50, 25)
+        self.bottom_save_btn.setStyleSheet(global_font + "background-color: #1e1e1e; border: 1px solid white; font-size: 11pt; color: white;")
+        self.bottom_save_btn.clicked.connect(self.open_excel_file)
+        bottom_layout.addWidget(self.bottom_save_btn, alignment=Qt.AlignRight)
+        bottom_layout.addStretch()
+        main_layout.addLayout(bottom_layout)
+    def modify_auto_update(self, site):
+        field = self.fetch_edits.get(site)
+        btn = self.modify_buttons.get(site)
+        if field is None or btn is None:
+            return
+        if field.isReadOnly():
+            field.setReadOnly(False)
+            field.clear()
+            btn.setText("완료")
+            btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: #00FF00;")
+        else:
+            field.setReadOnly(True)
+            btn.setText("수정")
+            btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: white;")
+            self.calculate_settlement()
+    def modify_bc_update(self):
+        if self.bc_auto_edit.isReadOnly():
+            self.bc_auto_edit.setReadOnly(False)
+            self.bc_auto_edit.clear()
+            self.bc_mod_btn.setText("완료")
+            self.bc_mod_btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: #00FF00;")
+        else:
+            self.bc_auto_edit.setReadOnly(True)
+            self.bc_mod_btn.setText("수정")
+            self.bc_mod_btn.setStyleSheet(global_font + "background-color: transparent; border: none; color: white;")
+            self.calculate_settlement()
+    def send_otp(self, site):
+        if site == "B.C":
+            otp_val = self.bc_otp_edit.text()
+        else:
+            otp_val = self.otp_inputs[site].text()
+        self.configs[site]['otp_value'] = otp_val
+        print(f"{site} OTP 전송: {otp_val}")
+        self.hide_otp(site)
+    def calculate_settlement(self):
+        try:
+            bc_val = float(re.sub(r"[^\d\.]", "", self.bc_auto_edit.text()))
+        except:
+            bc_val = 0.0
+        total_other = 0.0
+        for site in ["VECT PAY", "WING PAY", "개인장", "LEVEL 장"]:
+            try:
+                val = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get(site).text()))
+            except:
+                val = 0.0
+            total_other += val
+        self.sum_edit.setText(format_number(str(total_other)))
+        diff = bc_val - total_other
+        if diff == 0:
+            self.settlement_edit.setText(f"{format_number(str(diff))} (정상)")
+            self.settlement_edit.setStyleSheet(global_font + "font-size: 12pt; color: green; background-color: #2e2e2e;")
+            self.result_msg_label.setText("")
+            self.result_msg_label.setVisible(False)
+        else:
+            self.settlement_edit.setText(f"{format_number(str(diff))} (비정상)")
+            self.settlement_edit.setStyleSheet(global_font + "font-size: 12pt; color: red; background-color: #2e2e2e;")
+            if bc_val > total_other:
+                msg = "증복입금 혹은 오승인이 확인하세요."
+            elif total_other > bc_val:
+                msg = "입금후 미신청 혹은 핑돈 확인하세요."
+            self.result_msg_label.setText(msg)
+            self.result_msg_label.setVisible(True)
+    def update_error_label(self):
+        failed = [site for site, status in self.error_status.items() if status]
+        if failed:
+            self.error_label.setText("자동화 연동 실패: " + ", ".join(failed))
+            self.error_label.setVisible(True)
+        else:
+            self.error_label.setText("")
+            self.error_label.setVisible(False)
+    def start_timer(self):
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_time)
+        self.timer.start(1000)
+        self.update_time()
+    def update_time(self):
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self.bottom_info.setText(f"사용자: {self.login_id}    {current_time}")
+    def start_site_automation_all(self):
+        self.configs = site_configs
+        self.error_status = {site: False for site in self.configs.keys()}
+        self.site_auto_threads = []
+        for config in self.configs.values():
+            thread = SiteAutomationThread(config)
+            thread.automation_complete.connect(lambda res, s=config['site_name']: self.update_site_field(s, res))
+            thread.otp_ready.connect(self.animate_otp)
+            thread.otp_hide.connect(self.hide_otp)
+            thread.start()
+            self.site_auto_threads.append(thread)
+    def update_site_field(self, site, value):
+        if site == "B.C":
+            self.bc_auto_edit.setText(value)
+        else:
+            if site in self.fetch_edits:
+                self.fetch_edits[site].setText(value)
+        if value == "Automation Error":
+            self.error_status[site] = True
+        else:
+            self.error_status[site] = False
+        self.calculate_settlement()
+        self.update_error_label()
+    def animate_otp(self, site_name):
+        widgets = []
+        if site_name == "B.C":
+            widgets = [self.bc_otp_edit, self.bc_otp_btn]
+            self.error_label.setText("OTP 를 입력해주세요")
+            self.error_label.setVisible(True)
+        elif site_name in self.otp_inputs:
+            widgets = [self.otp_inputs[site_name], self.send_buttons[site_name]]
+        for widget in widgets:
+            widget.setVisible(True)
+            widget.setWindowOpacity(0)
+            anim = QPropertyAnimation(widget, b"windowOpacity")
+            anim.setDuration(2000)
+            anim.setStartValue(0)
+            anim.setEndValue(1)
+            anim.start()
+    def hide_otp(self, site_name):
+        if site_name == "B.C":
+            self.bc_otp_edit.setVisible(False)
+            self.bc_otp_btn.setVisible(False)
+            self.error_label.setVisible(False)
+        elif site_name in self.otp_inputs:
+            self.otp_inputs[site_name].setVisible(False)
+            self.send_buttons[site_name].setVisible(False)
+    def open_excel_file(self):
+        filepath = self.export_to_excel(returnPath=True)
+        if filepath:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(filepath))
+    def export_to_excel(self, returnPath=False):
+        try:
+            wb = openpyxl.Workbook()
+            sheet_name = "배컨 처리현황" + datetime.now().strftime("%Y%m%d")
+            ws = wb.active
+            ws.title = sheet_name
+            headers = ["처리현황", "", "아이디", "이름", "납입타입", "금액", "신청시간",
+                       "벡트페이 동일 이름 2분 차이 동일 금액", "벡트 페이 이름 총 금액",
+                       "윙글로벌 동일 이름 2분차이 동일금액", "푸쉬불렛", "푸쉬블랙 합계금액", "배컨 합계금액"]
+            ws.append(headers)
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            filename = f"정산보고서_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            filepath = os.path.join(desktop, filename)
+            wb.save(filepath)
+            QMessageBox.information(self, "엑셀 출력", f"엑셀 파일이 저장되었습니다:\n{filepath}")
+            if returnPath:
+                return filepath
+        except Exception as e:
+            QMessageBox.warning(self, "저장 오류", f"엑셀 저장 중 오류 발생: {e}")
+            return None
+    def start_excel_updater(self):
+        if self.excel_thread is None:
+            self.excel_thread = ExcelUpdaterThread(self.automation_on_time)
+            self.excel_thread.export_filepath = None
+            self.excel_thread.start()
+
+####################################################################################################
+# ExcelUpdaterThread: 데이터를 추출하여 Excel에 저장 (unchanged)
+####################################################################################################
+class ExcelUpdaterThread(QThread):
+    def __init__(self, on_time, parent=None):
+        super().__init__(parent)
+        self.on_time = on_time
+        self.running = True
+        self.export_filepath = None
+    def run(self):
+        wb = openpyxl.Workbook()
+        sheet_name = "배컨 처리현황" + datetime.now().strftime("%Y%m%d")
+        ws = wb.active
+        ws.title = sheet_name
+        headers = ["처리현황", "", "아이디", "이름", "납입타입", "금액", "신청시간",
+                   "벡트페이 동일 이름 2분 차이 동일 금액", "벡트 페이 이름 총 금액",
+                   "윙글로벌 동일 이름 2분차이 동일금액", "푸쉬불렛", "푸쉬블랙 합계금액", "배컨 합계금액"]
+        ws.append(headers)
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        filename = f"정산보고서_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        self.export_filepath = os.path.join(desktop, filename)
+        wb.save(self.export_filepath)
+        file_ctime = os.path.getctime(self.export_filepath)
+        if abs(file_ctime - self.on_time) > 5:
+            print("Excel 제작시간과 ON 클릭 시간이 일치하지 않음. 업데이트 시작 안함.")
+            return
+        cycle_count = 0
+        while self.running and cycle_count < 2:
+            time.sleep(5)
+            driver = create_chrome_driver(non_headless_options)
+            if driver is None:
+                print("ExcelUpdater: 드라이버 초기화 실패")
+                continue
+            driver.get("https://m.stock.naver.com/domestic/index/KOSDAQ/total")
+            try:
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div/div[13]/div[2]/table/tbody/tr[1]/td[2]/span/em"))
+                )
+                print("URL 로딩 완료 (ExcelUpdater)")
+            except Exception as e:
+                print("URL 로딩 대기 오류:", e)
+            a_elements = driver.find_elements(By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div/div[13]/div[2]/table/tbody/tr/td[1]/span[1]")
+            b_elements = driver.find_elements(By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div/div[13]/div[2]/table/tbody/tr/td[2]")
+            driver.quit()
+            a_data = [elem.text for elem in a_elements][:30]
+            b_data = [elem.text for elem in b_elements][:30]
+            if ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
+            for i in range(len(a_data)):
+                row_index = i + 2
+                ws.cell(row=row_index, column=1, value=a_data[i])
+                ws.cell(row=row_index, column=2, value=b_data[i])
+                ws.cell(row=row_index, column=24, value="TRUE" if a_data[i]==b_data[i] else "FALSE")
+            wb.save(self.export_filepath)
+            for i in range(len(a_data)):
+                row_index = i + 2
+                cell_value = ws.cell(row=row_index, column=24).value
+                if cell_value is not None and str(cell_value).upper() == "TRUE":
+                    b_value = ws.cell(row=row_index, column=2).value
+                    if b_value:
+                        print(f"Row {row_index} TRUE 발견. 입금승인완료 실행 (B열 값: {b_value})")
+                        입금승인완료(str(b_value))
+                        break
+            cycle_count += 1
+            time.sleep(7)
+    def stop(self):
+        self.running = False
+
+####################################################################################################
+# MainWindow: 화면 전환 및 종료 처리
+####################################################################################################
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("실시간 정산 시스템")
+        self.resize(900, 400)
+        self.stacked_widget = QStackedWidget()
+        self.setCentralWidget(self.stacked_widget)
+        self.login_widget = LoginWidget()
+        self.login_widget.login_success.connect(self.on_login_success)
+        self.stacked_widget.addWidget(self.login_widget)
+    def on_login_success(self, login_id):
+        print("로그인 성공:", login_id)
+        self.main_interface = MainInterfaceWidget(login_id)
+        self.stacked_widget.addWidget(self.main_interface)
+        self.stacked_widget.setCurrentWidget(self.main_interface)
+        print("메인 인터페이스로 전환됨")
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, 'main_interface'):
+                del self.main_interface
+        except Exception as e:
+            print("종료 시 오류:", e)
+        event.accept()
+
+def cleanup():
+    print("프로그램 종료, 모든 브라우저 종료")
+atexit.register(cleanup)
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyleSheet(global_font + """
+        QWidget {
+            background-color: #1e1e1e;
+            color: white;
+        }
+        QGroupBox {
+            background-color: #2e2e2e;
+            border: none;
+        }
+        QLineEdit {
+            background-color: #2e2e2e;
+            border: none;
+            border-radius: 5px;
+            padding: 6px;
+            font-size: 11pt;
+            color: white;
+        }
+        QPushButton {
+            background-color: #2e2e2e;
+            border: 1px solid white;
+            border-radius: 5px;
+            padding: 8px 16px;
+            font-size: 9pt;
+            color: white;
+        }
+        QPushButton:hover {
+            background-color: #3e3e3e;
+        }
+        QCheckBox {
+            font-size: 12pt;
+            color: white;
+        }
+        QTextEdit {
+            background-color: #2e2e2e;
+            border: none;
+            font-size: 11pt;
+            color: white;
+        }
+    """)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
+
+for i in range(101, 801):
+    print(f"# 패딩 줄 {i}")
